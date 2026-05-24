@@ -77,6 +77,15 @@ interface TimelineClip {
   trimStart: number;
 }
 
+interface TimelineStatePayload {
+  clips: TimelineClip[];
+  duration: number;
+  loopRange: { start: number; end: number };
+  playhead: number;
+  viewMode: ViewMode;
+  selectedClipId?: string | null;
+}
+
 interface TimelinePointerEdit {
   clipId: string;
   mode: 'move' | 'trim-start' | 'trim-end';
@@ -685,7 +694,7 @@ const hydrateColorMode = (): ColorMode => {
   return window.localStorage.getItem(COLOR_MODE_STORAGE_KEY) === 'day' ? 'day' : 'night';
 };
 
-const hydrateSavedTabs = (): { tabs: TabData[]; styleId: string } | null => {
+const hydrateSavedTabs = (): { tabs: TabData[]; styleId: string; timeline?: Partial<TimelineStatePayload> } | null => {
   if (typeof window === 'undefined') return null;
 
   try {
@@ -694,6 +703,7 @@ const hydrateSavedTabs = (): { tabs: TabData[]; styleId: string } | null => {
     const saved = JSON.parse(raw) as {
       styleId?: string;
       tabs?: Array<Omit<TabData, 'slots'> & { slotIds: Array<string | null> }>;
+      timeline?: Partial<TimelineStatePayload>;
     };
     const tabs = saved.tabs?.map((tab) => ({
       ...tab,
@@ -704,7 +714,7 @@ const hydrateSavedTabs = (): { tabs: TabData[]; styleId: string } | null => {
     }));
 
     if (!tabs?.length) return null;
-    return { tabs, styleId: saved.styleId ?? STYLE_PRESETS[0].id };
+    return { tabs, styleId: saved.styleId ?? STYLE_PRESETS[0].id, timeline: saved.timeline };
   } catch {
     return null;
   }
@@ -717,15 +727,15 @@ export default function App() {
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saved' | 'loaded'>('idle');
   const [colorMode, setColorMode] = useState<ColorMode>(hydrateColorMode);
   const [pendingPlayIds, setPendingPlayIds] = useState<Set<string>>(() => new Set());
-  const [viewMode, setViewMode] = useState<ViewMode>('matrix');
+  const [viewMode, setViewMode] = useState<ViewMode>(() => initialWorkbench?.timeline?.viewMode ?? 'matrix');
   const [isGlobalRecording, setIsGlobalRecording] = useState(false);
   const [arrangementEvents, setArrangementEvents] = useState<ArrangementEvent[]>([]);
-  const [timelineClips, setTimelineClips] = useState<TimelineClip[]>([]);
-  const [selectedTimelineClipId, setSelectedTimelineClipId] = useState<string | null>(null);
-  const [timelinePlayhead, setTimelinePlayhead] = useState(0);
+  const [timelineClips, setTimelineClips] = useState<TimelineClip[]>(() => initialWorkbench?.timeline?.clips ?? []);
+  const [selectedTimelineClipId, setSelectedTimelineClipId] = useState<string | null>(() => initialWorkbench?.timeline?.selectedClipId ?? null);
+  const [timelinePlayhead, setTimelinePlayhead] = useState(() => initialWorkbench?.timeline?.playhead ?? 0);
   const [isTimelinePlaying, setIsTimelinePlaying] = useState(false);
-  const [timelineDuration, setTimelineDuration] = useState(DEFAULT_TIMELINE_SECONDS);
-  const [timelineLoopRange, setTimelineLoopRange] = useState({ start: 0, end: 8 });
+  const [timelineDuration, setTimelineDuration] = useState(() => initialWorkbench?.timeline?.duration ?? DEFAULT_TIMELINE_SECONDS);
+  const [timelineLoopRange, setTimelineLoopRange] = useState(() => initialWorkbench?.timeline?.loopRange ?? { start: 0, end: 8 });
   const [bpm, setBpm] = useState(engineManager.bpm);
   
   const [activeTabId, setActiveTabId] = useState('tab-1');
@@ -930,6 +940,14 @@ export default function App() {
   const persistWorkbench = (nextTabs = tabs, styleId = selectedStyleId) => {
     const payload = {
       styleId,
+      timeline: {
+        clips: timelineClips,
+        duration: timelineDuration,
+        loopRange: timelineLoopRange,
+        playhead: timelinePlayhead,
+        viewMode,
+        selectedClipId: selectedTimelineClipId,
+      },
       tabs: nextTabs.map((tab) => ({
         ...tab,
         slotIds: tab.slots.map((slot) => slot?.id ?? null),
@@ -942,12 +960,24 @@ export default function App() {
     setSaveStatus('saved');
   };
 
+  useEffect(() => {
+    persistWorkbench(tabs, selectedStyleId);
+  }, [tabs, selectedStyleId, timelineClips, timelineDuration, timelineLoopRange, viewMode]);
+
   const loadWorkbench = () => {
     const saved = hydrateSavedTabs();
     if (!saved) return;
     setTabs(saved.tabs);
     setSelectedStyleId(saved.styleId);
     setActiveTabId(saved.tabs[0].id);
+    if (saved.timeline) {
+      setTimelineClips(saved.timeline.clips ?? []);
+      setTimelineDuration(saved.timeline.duration ?? DEFAULT_TIMELINE_SECONDS);
+      setTimelineLoopRange(saved.timeline.loopRange ?? { start: 0, end: 8 });
+      setTimelinePlayhead(saved.timeline.playhead ?? 0);
+      setViewMode(saved.timeline.viewMode ?? 'matrix');
+      setSelectedTimelineClipId(saved.timeline.selectedClipId ?? null);
+    }
     saved.tabs.forEach(syncProjectEngine);
     setSaveStatus('loaded');
   };
@@ -1503,6 +1533,7 @@ export default function App() {
     version: '1.0';
     tabs: SerializedTabData[];
     recordedSounds: SerializableSoundDef[];
+    timeline?: TimelineStatePayload;
     userSettings: {
       activeTabId: string;
       keyboardInstrumentMode: string;
@@ -1634,6 +1665,14 @@ export default function App() {
       version: '1.0',
       tabs: tabsPayload,
       recordedSounds: recordedPayload,
+      timeline: {
+        clips: timelineClips,
+        duration: timelineDuration,
+        loopRange: timelineLoopRange,
+        playhead: timelinePlayhead,
+        viewMode,
+        selectedClipId: selectedTimelineClipId,
+      },
       userSettings: {
         activeTabId,
         keyboardInstrumentMode,
@@ -1692,6 +1731,12 @@ export default function App() {
       setActiveTabId(data.userSettings?.activeTabId || importedTabs[0]?.id || 'tab-1');
       setKeyboardInstrumentMode(data.userSettings?.keyboardInstrumentMode || KEYBOARD_INSTRUMENT_MODES[0].id);
       setIsKeyboardVisible(Boolean(data.userSettings?.isKeyboardVisible));
+      setTimelineClips(data.timeline?.clips ?? []);
+      setTimelineDuration(data.timeline?.duration ?? DEFAULT_TIMELINE_SECONDS);
+      setTimelineLoopRange(data.timeline?.loopRange ?? { start: 0, end: 8 });
+      setTimelinePlayhead(data.timeline?.playhead ?? 0);
+      setViewMode(data.timeline?.viewMode ?? 'matrix');
+      setSelectedTimelineClipId(data.timeline?.selectedClipId ?? null);
 
       importedTabs.forEach((tab) => {
         const engine = engineManager.getProject(tab.id);
@@ -1721,6 +1766,8 @@ export default function App() {
   const handleDragStart = (e: React.DragEvent, item: SoundDef) => {
     const cleanItem = { ...item, buffer: undefined }; 
     e.dataTransfer.setData('application/json', JSON.stringify(cleanItem));
+    e.dataTransfer.setData('application/x-sound-id', item.id);
+    e.dataTransfer.setData('text/plain', item.id);
     e.dataTransfer.effectAllowed = 'copy';
   };
 
@@ -1761,6 +1808,36 @@ export default function App() {
   };
 
   const getSoundById = (id: string) => recordedSounds.find(sound => sound.id === id) || AVAILABLE_SOUNDS.find(sound => sound.id === id);
+
+  const findOpenTimelineTrack = (start: number, duration: number) => {
+    for (let track = 0; track < TIMELINE_TRACKS; track++) {
+      const hasOverlap = timelineClips.some((clip) => {
+        if (clip.track !== track) return false;
+        const clipEnd = clip.start + clip.duration;
+        const nextEnd = start + duration;
+        return start < clipEnd && nextEnd > clip.start;
+      });
+      if (!hasOverlap) return track;
+    }
+    return 0;
+  };
+
+  const addSoundToTimeline = (sound: SoundDef, options: { track?: number; start?: number } = {}) => {
+    const duration = Math.min(timelineDuration, 8, Math.max(1.5, sound.buffer?.duration ?? 4));
+    const start = Math.max(0, Math.min(timelineDuration - duration, snapTime(options.start ?? timelinePlayheadRef.current, timelineSnapCandidates())));
+    const track = options.track ?? findOpenTimelineTrack(start, duration);
+    setTimelineClips(prev => [
+      ...prev,
+      {
+        id: `clip-${Date.now()}`,
+        soundId: sound.id,
+        track,
+        start,
+        duration,
+        trimStart: 0,
+      },
+    ]);
+  };
 
   useEffect(() => {
     timelineLoopRangeRef.current = timelineLoopRange;
@@ -1815,28 +1892,20 @@ export default function App() {
     return (clientX - rect.left - 80) / PIXELS_PER_SECOND;
   };
 
-  const handleTimelineDrop = (e: React.DragEvent, track: number) => {
+  const handleTimelineDrop = (e: React.DragEvent, forcedTrack?: number) => {
     e.preventDefault();
-    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    const start = snapTime((e.clientX - rect.left) / PIXELS_PER_SECOND, timelineSnapCandidates());
+    const rect = timelineGridRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const start = snapTime((e.clientX - rect.left - 80) / PIXELS_PER_SECOND, timelineSnapCandidates());
+    const track = forcedTrack ?? Math.max(0, Math.min(TIMELINE_TRACKS - 1, Math.floor((e.clientY - rect.top) / TRACK_ROW_HEIGHT)));
 
     try {
+      const soundId = e.dataTransfer.getData('application/x-sound-id') || e.dataTransfer.getData('text/plain');
       const data = e.dataTransfer.getData('application/json');
-      const itemData = JSON.parse(data) as SoundDef;
-      const item = getSoundById(itemData.id);
+      const itemData = data ? JSON.parse(data) as SoundDef : null;
+      const item = getSoundById(soundId || itemData?.id || '');
       if (!item) return;
-      const duration = Math.min(timelineDuration, 8, Math.max(1.5, item.buffer?.duration ?? 4));
-      setTimelineClips(prev => [
-        ...prev,
-        {
-          id: `clip-${Date.now()}`,
-          soundId: item.id,
-          track,
-          start: Math.max(0, Math.min(timelineDuration - duration, start)),
-          duration,
-          trimStart: 0,
-        },
-      ]);
+      addSoundToTimeline(item, { track, start });
     } catch (err) {
       console.error('Timeline drop error', err);
     }
@@ -2152,11 +2221,42 @@ export default function App() {
               key={sound.id}
               draggable
               onDragStart={(e) => handleDragStart(e, sound)}
-              className={cn("rounded-lg border p-3 cursor-grab active:cursor-grabbing", isDayMode ? "bg-white border-slate-900/10 shadow-sm" : "bg-zinc-900/80 border-white/10")}
+              className={cn("group relative rounded-lg border p-3 cursor-grab active:cursor-grabbing", isDayMode ? "bg-white border-slate-900/10 shadow-sm" : "bg-zinc-900/80 border-white/10")}
             >
+              <button
+                type="button"
+                onClick={(e) => deleteRecordedSound(e, sound.id)}
+                onMouseDown={(e) => e.stopPropagation()}
+                draggable={false}
+                className={cn(
+                  "absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded-full border opacity-70 transition hover:opacity-100",
+                  isDayMode ? "border-slate-900/10 bg-slate-900/5 text-slate-500 hover:bg-red-500 hover:text-white" : "border-white/10 bg-black/30 text-zinc-400 hover:bg-red-500 hover:text-white"
+                )}
+                aria-label={`Delete ${sound.name}`}
+                title="Delete recording"
+              >
+                <X size={14} strokeWidth={3} />
+              </button>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  addSoundToTimeline(sound);
+                }}
+                onMouseDown={(e) => e.stopPropagation()}
+                draggable={false}
+                className={cn(
+                  "absolute right-10 top-2 flex h-7 w-7 items-center justify-center rounded-full border opacity-70 transition hover:opacity-100",
+                  isDayMode ? "border-slate-900/10 bg-slate-900/5 text-slate-500 hover:bg-emerald-500 hover:text-white" : "border-white/10 bg-black/30 text-zinc-400 hover:bg-emerald-500 hover:text-white"
+                )}
+                aria-label={`Add ${sound.name} to timeline`}
+                title="Add to timeline"
+              >
+                <Plus size={14} strokeWidth={3} />
+              </button>
               <div className="mb-3 flex items-center justify-between gap-2">
-                <span className={cn("truncate text-[11px] font-bold uppercase tracking-widest", isDayMode ? "text-slate-800" : "text-zinc-100")}>{sound.name}</span>
-                <span className={cn("h-2 w-2 rounded-full", sound.color || CLIP_COLOR_CLASSES[index % CLIP_COLOR_CLASSES.length])}></span>
+                <span className={cn("max-w-[calc(100%-4.75rem)] truncate text-[11px] font-bold uppercase tracking-widest", isDayMode ? "text-slate-800" : "text-zinc-100")}>{sound.name}</span>
+                <span className={cn("mr-16 h-2 w-2 rounded-full", sound.color || CLIP_COLOR_CLASSES[index % CLIP_COLOR_CLASSES.length])}></span>
               </div>
               <div className="flex h-8 items-end gap-1">
                 {[0.32, 0.68, 0.46, 0.88, 0.58, 0.76, 0.38, 0.66].map((height, i) => (
@@ -2235,7 +2335,12 @@ export default function App() {
               ))}
             </div>
 
-            <div ref={timelineGridRef} className="relative space-y-2">
+            <div
+              ref={timelineGridRef}
+              onDrop={handleTimelineDrop}
+              onDragOver={handleDragOver}
+              className="relative space-y-2"
+            >
               <div
                 className="pointer-events-none absolute top-0 bottom-0 z-10 border-x border-emerald-300/60 bg-emerald-400/10"
                 style={{
@@ -2290,7 +2395,10 @@ export default function App() {
                     Track {track + 1}
                   </div>
                   <div
-                    onDrop={(e) => handleTimelineDrop(e, track)}
+                    onDrop={(e) => {
+                      e.stopPropagation();
+                      handleTimelineDrop(e, track);
+                    }}
                     onDragOver={handleDragOver}
                     onPointerDown={handleTimelineSurfacePointerDown}
                     className={cn("relative h-24 overflow-hidden border-b", isDayMode ? "border-slate-900/10 bg-white/45" : "border-white/5 bg-white/[0.025]")}
@@ -2907,6 +3015,24 @@ export default function App() {
     }
   };
 
+  const deleteRecordedSound = (e: React.MouseEvent, soundId: string) => {
+    e.stopPropagation();
+    setRecordedSounds(prev => prev.filter(sound => sound.id !== soundId));
+    setTimelineClips(prev => prev.filter(clip => clip.soundId !== soundId));
+    setSelectedTimelineClipId(prev => {
+      const selectedClip = timelineClips.find(clip => clip.id === prev);
+      return selectedClip?.soundId === soundId ? null : prev;
+    });
+
+    setTabs(prev => prev.map(tab => {
+      const nextSlots = tab.slots.map(slot => slot?.id === soundId ? null : slot);
+      if (nextSlots.every((slot, index) => slot === tab.slots[index])) return tab;
+      const nextTab = { ...tab, slots: nextSlots };
+      syncProjectEngine(nextTab);
+      return nextTab;
+    }));
+  };
+
   const categories = [
     { id: 'beat', name: 'Beats' },
     { id: 'effect', name: 'Effects' },
@@ -2979,9 +3105,38 @@ export default function App() {
                {cat.id === 'custom' && (
                  <button
                    onClick={(e) => toggleLoopMode(e, item.id)}
-                   className="absolute -top-1 -right-1 px-1.5 py-0.5 bg-zinc-600 hover:bg-zinc-500 rounded text-[7px] font-bold text-white shadow-md z-10 uppercase transition-colors"
+                   className="absolute -top-1 right-14 px-1.5 py-0.5 bg-zinc-600 hover:bg-zinc-500 rounded text-[7px] font-bold text-white shadow-md z-10 uppercase transition-colors"
                  >
                    {item.loopMode === 'fast' ? 'FAST' : 'FULL'}
+                 </button>
+               )}
+               {cat.id === 'custom' && (
+                 <button
+                   type="button"
+                   onClick={(e) => {
+                     e.stopPropagation();
+                     addSoundToTimeline(item);
+                   }}
+                   onMouseDown={(e) => e.stopPropagation()}
+                   draggable={false}
+                   className="absolute -top-1 right-6 flex h-5 w-5 items-center justify-center rounded-full bg-emerald-500 text-white opacity-85 shadow-md transition hover:opacity-100 z-20"
+                   aria-label={`Add ${item.name} to timeline`}
+                   title="Add to timeline"
+                 >
+                   <Plus size={12} strokeWidth={3} />
+                 </button>
+               )}
+               {cat.id === 'custom' && (
+                 <button
+                   type="button"
+                   onClick={(e) => deleteRecordedSound(e, item.id)}
+                   onMouseDown={(e) => e.stopPropagation()}
+                   draggable={false}
+                   className="absolute -top-1 -right-1 flex h-5 w-5 items-center justify-center rounded-full bg-red-500 text-white opacity-85 shadow-md transition hover:opacity-100 z-20"
+                   aria-label={`Delete ${item.name}`}
+                   title="Delete recording"
+                 >
+                   <X size={12} strokeWidth={3} />
                  </button>
                )}
                <div className="flex justify-between items-start mb-2">
