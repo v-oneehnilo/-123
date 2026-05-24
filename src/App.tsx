@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { Play, Square, UserCircle2, X, Mic, MicOff, Upload, Plus, RotateCcw, Shuffle, Keyboard, Circle, Wand2, Sun, Moon, Trash2, Radio, ListMusic, Scissors, Copy, MoveHorizontal, SkipBack, SkipForward, Pause } from 'lucide-react';
+﻿import React, { useState, useEffect, useRef } from 'react';
+import { Play, Square, UserCircle2, X, Mic, MicOff, Upload, Plus, RotateCcw, Shuffle, Keyboard, Circle, Wand2, Sun, Moon, Trash2, Radio, ListMusic, Scissors, Copy, MoveHorizontal, SkipBack, SkipForward, Pause, Save } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { AUDIO_STYLES, AVAILABLE_SOUNDS, AudioStyleId, SoundDef, engineManager, FxParams, defaultFx, KEYBOARD_NOTES } from './audio';
 import { cn } from './lib/utils';
@@ -26,7 +26,6 @@ interface LiveFxPreset {
   color: string;
   duration: number;
 }
-
 interface LiveFxControls {
   speed: number;
   volume: number;
@@ -58,6 +57,7 @@ interface TabData {
 }
 
 type ViewMode = 'matrix' | 'timeline';
+type GlobalRecordingState = 'idle' | 'waiting' | 'recording' | 'stopping';
 
 interface ArrangementEvent {
   id: string;
@@ -120,6 +120,41 @@ interface StylePreset {
 
 type ColorMode = 'night' | 'day';
 type AudioTransportState = 'stopped' | 'playing' | 'paused';
+type ArrangementFilePermissionMode = 'read' | 'readwrite';
+
+interface ArrangementFileWritable {
+  write: (data: Blob | BufferSource | string) => Promise<void>;
+  close: () => Promise<void>;
+}
+
+interface ArrangementFileHandle {
+  name: string;
+  createWritable: () => Promise<ArrangementFileWritable>;
+  queryPermission?: (descriptor?: { mode?: ArrangementFilePermissionMode }) => Promise<PermissionState>;
+  requestPermission?: (descriptor?: { mode?: ArrangementFilePermissionMode }) => Promise<PermissionState>;
+}
+
+interface ArrangementSaveFilePickerOptions {
+  suggestedName?: string;
+  types?: Array<{
+    description: string;
+    accept: Record<string, string[]>;
+  }>;
+}
+
+interface ArrangementExportTarget {
+  fileName: string;
+  savedAt: number;
+  mode: 'file-handle' | 'download';
+}
+
+interface ArrangementExportTargetRecord extends ArrangementExportTarget {
+  handle: ArrangementFileHandle;
+}
+
+interface WindowWithArrangementFilePicker extends Window {
+  showSaveFilePicker?: (options?: ArrangementSaveFilePickerOptions) => Promise<ArrangementFileHandle>;
+}
 
 type MixerAudioTelemetry = AudioFrameMessage & {
   beat: number;
@@ -137,6 +172,10 @@ type MixerAudioTelemetry = AudioFrameMessage & {
 
 const clampUnit = (value: number) => Math.max(0, Math.min(1, value));
 const average = (values: number[]) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
+const MUSICARR_FILE_MIME = 'application/json';
+const EXPORT_TARGET_DB_NAME = 'musicarr-export-target';
+const EXPORT_TARGET_STORE = 'targets';
+const EXPORT_TARGET_KEY = 'last-export';
 const BAND_SHAPE = [0.22, 0.45, 0.74, 1, 0.74, 0.45, 0.22];
 const CATEGORY_BAND_CENTERS: Record<string, number> = {
   beat: 1,
@@ -538,7 +577,7 @@ const buildMixerTelemetry = (
     type: 'mixer.audioFrame',
     sourceId: tab.id,
     deviceId: 'mixer-target-123',
-    displayName: `${tab.name} · ${style.name}`,
+    displayName: `${tab.name} 路 ${style.name}`,
     timestamp: Date.now(),
     level,
     rms,
@@ -720,6 +759,72 @@ const hydrateSavedTabs = (): { tabs: TabData[]; styleId: string; timeline?: Part
   }
 };
 
+const openExportTargetDb = () => new Promise<IDBDatabase | null>((resolve) => {
+  if (typeof indexedDB === 'undefined') {
+    resolve(null);
+    return;
+  }
+
+  const request = indexedDB.open(EXPORT_TARGET_DB_NAME, 1);
+  request.onupgradeneeded = () => {
+    const db = request.result;
+    if (!db.objectStoreNames.contains(EXPORT_TARGET_STORE)) {
+      db.createObjectStore(EXPORT_TARGET_STORE);
+    }
+  };
+  request.onsuccess = () => resolve(request.result);
+  request.onerror = () => resolve(null);
+  request.onblocked = () => resolve(null);
+});
+
+const loadStoredExportTarget = async (): Promise<ArrangementExportTargetRecord | null> => {
+  const db = await openExportTargetDb();
+  if (!db) return null;
+
+  return new Promise((resolve) => {
+    const tx = db.transaction(EXPORT_TARGET_STORE, 'readonly');
+    const request = tx.objectStore(EXPORT_TARGET_STORE).get(EXPORT_TARGET_KEY);
+    request.onsuccess = () => {
+      const record = request.result as ArrangementExportTargetRecord | undefined;
+      resolve(record?.handle ? record : null);
+    };
+    request.onerror = () => resolve(null);
+    tx.oncomplete = () => db.close();
+    tx.onerror = () => {
+      db.close();
+      resolve(null);
+    };
+  });
+};
+
+const storeExportTarget = async (record: ArrangementExportTargetRecord) => {
+  const db = await openExportTargetDb();
+  if (!db) return;
+
+  await new Promise<void>((resolve) => {
+    const tx = db.transaction(EXPORT_TARGET_STORE, 'readwrite');
+    tx.objectStore(EXPORT_TARGET_STORE).put(record, EXPORT_TARGET_KEY);
+    tx.oncomplete = () => {
+      db.close();
+      resolve();
+    };
+    tx.onerror = () => {
+      db.close();
+      resolve();
+    };
+  });
+};
+
+const sanitizeMusicarrFileName = (fileName: string) => {
+  const safeName = fileName
+    .trim()
+    .replace(/[\\/:*?"<>|]+/g, '-')
+    .replace(/\s+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  const baseName = safeName || 'arrangement';
+  return baseName.toLowerCase().endsWith('.musicarr') ? baseName : `${baseName}.musicarr`;
+};
+
 export default function App() {
   const [initialWorkbench] = useState(hydrateSavedTabs);
   const [tabs, setTabs] = useState<TabData[]>(() => initialWorkbench?.tabs ?? [createCodexSongTab()]);
@@ -729,6 +834,7 @@ export default function App() {
   const [pendingPlayIds, setPendingPlayIds] = useState<Set<string>>(() => new Set());
   const [viewMode, setViewMode] = useState<ViewMode>(() => initialWorkbench?.timeline?.viewMode ?? 'matrix');
   const [isGlobalRecording, setIsGlobalRecording] = useState(false);
+  const [globalRecordingState, setGlobalRecordingState] = useState<GlobalRecordingState>('idle');
   const [arrangementEvents, setArrangementEvents] = useState<ArrangementEvent[]>([]);
   const [timelineClips, setTimelineClips] = useState<TimelineClip[]>(() => initialWorkbench?.timeline?.clips ?? []);
   const [selectedTimelineClipId, setSelectedTimelineClipId] = useState<string | null>(() => initialWorkbench?.timeline?.selectedClipId ?? null);
@@ -764,9 +870,17 @@ export default function App() {
   const audioChunksRef = useRef<Blob[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const importFileInputRef = useRef<HTMLInputElement>(null);
+  const exportFileHandleRef = useRef<ArrangementFileHandle | null>(null);
+  const [exportTarget, setExportTarget] = useState<ArrangementExportTarget | null>(null);
+  const [isExportingArrangement, setIsExportingArrangement] = useState(false);
+  const [isSavingArrangementFile, setIsSavingArrangementFile] = useState(false);
   const globalRecordStartedAtRef = useRef<number>(0);
   const globalRecorderRef = useRef<MediaRecorder | null>(null);
   const globalRecordChunksRef = useRef<Blob[]>([]);
+  const globalRecordingStateRef = useRef<GlobalRecordingState>('idle');
+  const globalRecordTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const startGlobalRecordingRef = useRef<() => void>(() => {});
+  const stopGlobalRecordingRef = useRef<() => void>(() => {});
   const timelineGridRef = useRef<HTMLDivElement>(null);
   const timelineEditRef = useRef<TimelinePointerEdit | null>(null);
   const timelineTransportEditRef = useRef<TimelineTransportEdit | null>(null);
@@ -868,6 +982,20 @@ export default function App() {
   useEffect(() => {
     setSaveStatus('idle');
   }, [tabs, selectedStyleId]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    loadStoredExportTarget().then((record) => {
+      if (cancelled || !record) return;
+      exportFileHandleRef.current = record.handle;
+      setExportTarget({ fileName: record.fileName, savedAt: record.savedAt, mode: 'file-handle' });
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     window.localStorage.setItem(COLOR_MODE_STORAGE_KEY, colorMode);
@@ -1421,7 +1549,20 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, []);
 
+  const clearGlobalRecordTimer = () => {
+    if (!globalRecordTimerRef.current) return;
+    clearTimeout(globalRecordTimerRef.current);
+    globalRecordTimerRef.current = null;
+  };
+
+  const setGlobalRecordState = (state: GlobalRecordingState) => {
+    globalRecordingStateRef.current = state;
+    setGlobalRecordingState(state);
+    setIsGlobalRecording(state === 'recording' || state === 'stopping');
+  };
+
   const startGlobalRecording = () => {
+    if (globalRecorderRef.current?.state === 'recording') return;
     try {
       engineManager.init();
       const stream = engineManager.startCaptureStream();
@@ -1442,7 +1583,10 @@ export default function App() {
         const blob = new Blob(globalRecordChunksRef.current, { type: mimeType || 'audio/webm' });
         globalRecordChunksRef.current = [];
         globalRecordStartedAtRef.current = 0;
-        if (!blob.size) return;
+        if (!blob.size) {
+          setGlobalRecordState('idle');
+          return;
+        }
 
         try {
           engineManager.init();
@@ -1452,7 +1596,7 @@ export default function App() {
           const soundIndex = recordedSounds.filter(sound => sound.id.startsWith('arr-')).length + 1;
           const newSound: SoundDef = {
             id: `arr-${Date.now()}`,
-            name: `内录原声 ${soundIndex}`,
+            name: `鍐呭綍鍘熷０ ${soundIndex}`,
             category: 'custom',
             color: CLIP_COLOR_CLASSES[recordedSounds.length % CLIP_COLOR_CLASSES.length],
             pattern: [{ note: 1 }, ...new Array(15).fill({})],
@@ -1477,38 +1621,92 @@ export default function App() {
         } catch (err) {
           console.error('Global recording decode failed', err);
           alert('录制完成，但音频生成失败，请再试一次。');
+        } finally {
+          setGlobalRecordState('idle');
         }
       };
 
       recorder.start();
       globalRecorderRef.current = recorder;
-      setIsGlobalRecording(true);
+      setGlobalRecordState('recording');
     } catch (err) {
       engineManager.stopCaptureStream();
       globalRecorderRef.current = null;
+      setGlobalRecordState('idle');
       console.error('Global recording failed', err);
-      alert('无法开始全局录制，请先点击播放一个标签后再试。');
+      alert('无法开始全局录制，请先播放一个标签后再试。');
     }
   };
 
   const stopGlobalRecording = () => {
-    setIsGlobalRecording(false);
+    clearGlobalRecordTimer();
     if (globalRecorderRef.current?.state === 'recording') {
       globalRecorderRef.current.requestData();
       globalRecorderRef.current.stop();
     } else {
       engineManager.stopCaptureStream();
       globalRecorderRef.current = null;
+      setGlobalRecordState('idle');
     }
   };
 
-  const toggleGlobalRecording = () => {
-    if (isGlobalRecording) {
-      stopGlobalRecording();
-    } else {
-      startGlobalRecording();
+  const handleGlobalRecordingToggle = () => {
+    if (globalRecordingStateRef.current === 'waiting') {
+      clearGlobalRecordTimer();
+      setGlobalRecordState('idle');
+      return;
     }
+
+    if (globalRecordingStateRef.current === 'recording') {
+      clearGlobalRecordTimer();
+      setGlobalRecordState('stopping');
+      return;
+    }
+
+    if (globalRecordingStateRef.current === 'stopping') return;
+
+    engineManager.init();
+    clearGlobalRecordTimer();
+    setGlobalRecordState('waiting');
   };
+
+  startGlobalRecordingRef.current = startGlobalRecording;
+  stopGlobalRecordingRef.current = stopGlobalRecording;
+
+  useEffect(() => {
+    const handleBpmLoopStart = (event: Event) => {
+      const detail = (event as CustomEvent<{ scheduledTime?: number; currentTime?: number }>).detail ?? {};
+      const scheduledTime = detail.scheduledTime ?? engineManager.ctx?.currentTime ?? 0;
+      const currentTime = detail.currentTime ?? engineManager.ctx?.currentTime ?? scheduledTime;
+      const delayMs = Math.max(0, (scheduledTime - currentTime) * 1000);
+
+      if (globalRecordingStateRef.current === 'waiting') {
+        clearGlobalRecordTimer();
+        globalRecordTimerRef.current = setTimeout(() => {
+          globalRecordTimerRef.current = null;
+          if (globalRecordingStateRef.current === 'waiting') {
+            startGlobalRecordingRef.current();
+          }
+        }, delayMs);
+      }
+
+      if (globalRecordingStateRef.current === 'stopping') {
+        clearGlobalRecordTimer();
+        globalRecordTimerRef.current = setTimeout(() => {
+          globalRecordTimerRef.current = null;
+          if (globalRecordingStateRef.current === 'stopping') {
+            stopGlobalRecordingRef.current();
+          }
+        }, delayMs);
+      }
+    };
+
+    window.addEventListener('bpm-loop-start', handleBpmLoopStart);
+    return () => {
+      window.removeEventListener('bpm-loop-start', handleBpmLoopStart);
+      clearGlobalRecordTimer();
+    };
+  }, []);
 
   interface SerializableSoundDef extends Omit<SoundDef, 'buffer'> {
     bufferBase64?: string;
@@ -1533,7 +1731,7 @@ export default function App() {
     version: '1.0';
     tabs: SerializedTabData[];
     recordedSounds: SerializableSoundDef[];
-    timeline?: TimelineStatePayload;
+    timeline?: Partial<TimelineStatePayload>;
     userSettings: {
       activeTabId: string;
       keyboardInstrumentMode: string;
@@ -1666,11 +1864,11 @@ export default function App() {
       tabs: tabsPayload,
       recordedSounds: recordedPayload,
       timeline: {
-        clips: timelineClips,
         duration: timelineDuration,
-        loopRange: timelineLoopRange,
-        playhead: timelinePlayhead,
         viewMode,
+        playhead: timelinePlayheadRef.current,
+        loopRange: timelineLoopRange,
+        clips: timelineClips,
         selectedClipId: selectedTimelineClipId,
       },
       userSettings: {
@@ -1681,19 +1879,119 @@ export default function App() {
     };
   };
 
+  const createMusicarrText = async () => {
+    const payload = await createMusicarrPayload();
+    return JSON.stringify(payload, null, 2);
+  };
+
+  const createSuggestedExportFileName = () => {
+    const timestamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
+    return sanitizeMusicarrFileName(`${activeTab?.name || 'arrangement'}-${timestamp}`);
+  };
+
+  const downloadMusicarrFile = (text: string, fileName: string) => {
+    const blob = new Blob([text], { type: MUSICARR_FILE_MIME });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = fileName;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const ensureArrangementFilePermission = async (handle: ArrangementFileHandle) => {
+    if (!handle.queryPermission || !handle.requestPermission) return true;
+
+    const descriptor = { mode: 'readwrite' as ArrangementFilePermissionMode };
+    const currentPermission = await handle.queryPermission(descriptor);
+    if (currentPermission === 'granted') return true;
+    const nextPermission = await handle.requestPermission(descriptor);
+    return nextPermission === 'granted';
+  };
+
+  const writeArrangementFile = async (handle: ArrangementFileHandle, text: string) => {
+    const hasPermission = await ensureArrangementFilePermission(handle);
+    if (!hasPermission) throw new Error('file-permission-denied');
+
+    const writable = await handle.createWritable();
+    await writable.write(new Blob([text], { type: MUSICARR_FILE_MIME }));
+    await writable.close();
+  };
+
+  const rememberExportTarget = async (handle: ArrangementFileHandle) => {
+    const target = {
+      fileName: handle.name,
+      savedAt: Date.now(),
+      mode: 'file-handle' as const,
+    };
+    exportFileHandleRef.current = handle;
+    setExportTarget(target);
+    await storeExportTarget({ ...target, handle });
+  };
+
+  const isPickerAbort = (err: unknown) => err instanceof DOMException && err.name === 'AbortError';
+
   const handleExportArrangement = async () => {
+    if (isExportingArrangement) return;
+    setIsExportingArrangement(true);
+
     try {
-      const payload = await createMusicarrPayload();
-      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement('a');
-      anchor.href = url;
-      anchor.download = `arrangement-${Date.now()}.musicarr`;
-      anchor.click();
-      URL.revokeObjectURL(url);
+      const text = await createMusicarrText();
+      const suggestedName = createSuggestedExportFileName();
+      const saveFilePicker = (window as WindowWithArrangementFilePicker).showSaveFilePicker;
+
+      if (saveFilePicker) {
+        const handle = await saveFilePicker({
+          suggestedName,
+          types: [
+            {
+              description: 'Music Arrangement',
+              accept: {
+                [MUSICARR_FILE_MIME]: ['.musicarr'],
+              },
+            },
+          ],
+        });
+        await writeArrangementFile(handle, text);
+        await rememberExportTarget(handle);
+        return;
+      }
+
+      const fallbackName = window.prompt('璇疯緭鍏ュ鍑烘枃浠跺悕', suggestedName);
+      if (!fallbackName) return;
+      const fileName = sanitizeMusicarrFileName(fallbackName);
+      downloadMusicarrFile(text, fileName);
+      exportFileHandleRef.current = null;
+      setExportTarget({ fileName, savedAt: Date.now(), mode: 'download' });
     } catch (err) {
+      if (isPickerAbort(err)) return;
       console.error('Export failed', err);
       alert('导出失败，请重试。');
+    } finally {
+      setIsExportingArrangement(false);
+    }
+  };
+
+  const handleSaveArrangementFile = async () => {
+    if (!exportTarget || isSavingArrangementFile || isExportingArrangement) return;
+    const handle = exportFileHandleRef.current;
+
+    setIsSavingArrangementFile(true);
+    try {
+      const text = await createMusicarrText();
+      if (handle) {
+        await writeArrangementFile(handle, text);
+        await rememberExportTarget(handle);
+      } else {
+        downloadMusicarrFile(text, exportTarget.fileName);
+        setExportTarget({ ...exportTarget, savedAt: Date.now() });
+      }
+    } catch (err) {
+      if (isPickerAbort(err)) return;
+      console.error('Save failed', err);
+      alert('保存失败，请确认浏览器文件权限，或点击 Export 重新选择保存位置。');
+    } finally {
+      setIsSavingArrangementFile(false);
     }
   };
 
@@ -1731,12 +2029,34 @@ export default function App() {
       setActiveTabId(data.userSettings?.activeTabId || importedTabs[0]?.id || 'tab-1');
       setKeyboardInstrumentMode(data.userSettings?.keyboardInstrumentMode || KEYBOARD_INSTRUMENT_MODES[0].id);
       setIsKeyboardVisible(Boolean(data.userSettings?.isKeyboardVisible));
-      setTimelineClips(data.timeline?.clips ?? []);
-      setTimelineDuration(data.timeline?.duration ?? DEFAULT_TIMELINE_SECONDS);
-      setTimelineLoopRange(data.timeline?.loopRange ?? { start: 0, end: 8 });
-      setTimelinePlayhead(data.timeline?.playhead ?? 0);
-      setViewMode(data.timeline?.viewMode ?? 'matrix');
-      setSelectedTimelineClipId(data.timeline?.selectedClipId ?? null);
+      if (data.timeline) {
+        const nextDuration = Math.max(1, Math.min(600, Number(data.timeline.duration) || DEFAULT_TIMELINE_SECONDS));
+        const nextLoopStart = Math.max(0, Math.min(data.timeline.loopRange?.start ?? 0, nextDuration - 0.25));
+        const nextLoopEnd = Math.max(nextLoopStart + 0.25, Math.min(data.timeline.loopRange?.end ?? Math.min(8, nextDuration), nextDuration));
+        const nextPlayhead = Math.max(0, Math.min(data.timeline.playhead ?? nextLoopStart, nextDuration));
+        const nextClips = (data.timeline.clips || []).map((clip) => {
+          const duration = Math.max(0.5, Math.min(clip.duration, nextDuration));
+          return {
+            ...clip,
+            track: Math.max(0, Math.min(TIMELINE_TRACKS - 1, clip.track)),
+            start: Math.max(0, Math.min(clip.start, Math.max(0, nextDuration - duration))),
+            duration,
+            trimStart: Math.max(0, clip.trimStart),
+          };
+        });
+        setTimelineDuration(nextDuration);
+        setTimelineLoopRange({ start: nextLoopStart, end: nextLoopEnd });
+        setTimelinePlayhead(nextPlayhead);
+        timelinePlayheadRef.current = nextPlayhead;
+        timelineOffsetRef.current = nextPlayhead;
+        setTimelineClips(nextClips);
+        setViewMode(data.timeline.viewMode ?? 'timeline');
+        setSelectedTimelineClipId(data.timeline.selectedClipId ?? null);
+      } else {
+        setTimelineClips([]);
+        setViewMode('matrix');
+        setSelectedTimelineClipId(null);
+      }
 
       importedTabs.forEach((tab) => {
         const engine = engineManager.getProject(tab.id);
@@ -2203,17 +2523,62 @@ export default function App() {
     };
   }, [timelineClips, recordedSounds]);
 
+  const deleteRecordedSound = (soundId: string, event?: React.MouseEvent) => {
+    event?.stopPropagation();
+    if (isTimelinePlaying) stopTimelinePlayback(false);
+    setRecordedSounds(prev => prev.filter(sound => sound.id !== soundId));
+    setTimelineClips(prev => prev.filter(clip => clip.soundId !== soundId));
+    setSelectedTimelineClipId(prev => {
+      const selectedClip = timelineClips.find(clip => clip.id === prev);
+      return selectedClip?.soundId === soundId ? null : prev;
+    });
+
+    setTabs(prev => prev.map(tab => {
+      const nextSlots = tab.slots.map(slot => slot?.id === soundId ? null : slot);
+      if (nextSlots.every((slot, index) => slot === tab.slots[index])) return tab;
+      const nextTab = { ...tab, slots: nextSlots };
+      syncProjectEngine(nextTab);
+      return nextTab;
+    }));
+  };
+
+  const clearRecordedSounds = () => {
+    if (recordedSounds.length === 0) return;
+    if (isTimelinePlaying) stopTimelinePlayback(false);
+    const soundIds = new Set(recordedSounds.map(sound => sound.id));
+    setRecordedSounds([]);
+    setTimelineClips(prev => prev.filter(clip => !soundIds.has(clip.soundId)));
+    setSelectedTimelineClipId(null);
+  };
+
   const renderTimelinePage = () => (
     <main className="min-h-0 flex-1 grid grid-cols-[260px_minmax(0,1fr)] gap-0 overflow-hidden">
       <aside className={cn("border-r p-4 flex flex-col gap-4 overflow-hidden", isDayMode ? "border-slate-900/10 bg-white/75" : "border-white/5 bg-black/35")}>
         <div className="flex items-center justify-between">
           <h2 className={cn("text-[10px] font-bold uppercase tracking-[0.22em]", mutedTextClass)}>素材库</h2>
-          <span className={cn("rounded px-2 py-1 text-[9px] font-bold", isDayMode ? "bg-slate-900/5 text-slate-500" : "bg-white/5 text-zinc-500")}>{recordedSounds.length}</span>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={clearRecordedSounds}
+              disabled={recordedSounds.length === 0}
+              aria-label="Clear all recorded materials"
+              title="娓呯┖鍏ㄩ儴绱犳潗"
+              className={cn(
+                "flex h-7 w-7 items-center justify-center rounded-lg border transition-colors",
+                recordedSounds.length === 0
+                  ? isDayMode ? "border-slate-900/5 bg-slate-900/5 text-slate-300 cursor-not-allowed" : "border-white/5 bg-white/5 text-zinc-700 cursor-not-allowed"
+                  : isDayMode ? "border-slate-900/10 bg-slate-900/5 text-slate-500 hover:bg-red-50 hover:text-red-600" : "border-white/5 bg-white/5 text-zinc-500 hover:bg-red-500/15 hover:text-red-300"
+              )}
+            >
+              <Trash2 size={13} strokeWidth={2.4} />
+            </button>
+            <span className={cn("rounded px-2 py-1 text-[9px] font-bold", isDayMode ? "bg-slate-900/5 text-slate-500" : "bg-white/5 text-zinc-500")}>{recordedSounds.length}</span>
+          </div>
         </div>
         <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1 scrollbar-none">
           {recordedSounds.length === 0 && (
             <div className={cn("rounded-xl border border-dashed p-4 text-[11px] leading-relaxed", isDayMode ? "border-slate-900/15 text-slate-400" : "border-white/10 text-zinc-600")}>
-              点击顶部录制按钮，播放几个标签片段，再停止录制。生成的音乐片段会自动出现在这里。
+              鐐瑰嚮椤堕儴褰曞埗鎸夐挳锛屾挱鏀惧嚑涓爣绛剧墖娈碉紝鍐嶅仠姝㈠綍鍒躲€傜敓鎴愮殑闊充箰鐗囨浼氳嚜鍔ㄥ嚭鐜板湪杩欓噷銆?
             </div>
           )}
           {recordedSounds.map((sound, index) => (
@@ -2225,7 +2590,7 @@ export default function App() {
             >
               <button
                 type="button"
-                onClick={(e) => deleteRecordedSound(e, sound.id)}
+                onClick={(e) => deleteRecordedSound(sound.id, e)}
                 onMouseDown={(e) => e.stopPropagation()}
                 draggable={false}
                 className={cn(
@@ -2550,53 +2915,68 @@ export default function App() {
   // Recording & Upload Logic
   const startRecording = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      const mimeType = getInternalRecordingMimeType();
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
       mediaRecorderRef.current = recorder;
       audioChunksRef.current = [];
 
-      recorder.ondataavailable = (e) => audioChunksRef.current.push(e.data);
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data);
+      };
 
       recorder.onstop = async () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
+        const audioBlob = new Blob(audioChunksRef.current, { type: recorder.mimeType || mimeType || 'audio/webm' });
+        audioChunksRef.current = [];
+        mediaRecorderRef.current = null;
+        setIsRecording(false);
+        stream.getTracks().forEach(track => track.stop());
+        if (!audioBlob.size) return;
+
         const arrayBuffer = await audioBlob.arrayBuffer();
         
         engineManager.init();
         if (engineManager.ctx) {
           try {
-            const rawBuffer = await engineManager.ctx.decodeAudioData(arrayBuffer);
-            const processedBuffer = await engineManager.processBuffer(rawBuffer);
+            const micBuffer = await engineManager.ctx.decodeAudioData(arrayBuffer);
             
             const newSound: SoundDef = {
               id: `rec-${Date.now()}`,
-              name: `Voice Rec ${recordedSounds.filter(s => s.id.startsWith('rec-')).length + 1}`,
+              name: `Mic Voice ${recordedSounds.filter(s => s.id.startsWith('rec-')).length + 1}`,
               category: 'custom',
               color: 'bg-pink-500',
-              pattern: [], // Empty pattern for buffer mode
-              buffer: processedBuffer,
+              pattern: [{ note: 1 }, ...new Array(15).fill({})],
+              buffer: micBuffer,
               loopMode: 'full',
-              playMode: 'buffer' // Use buffer mode for direct audio playback
+              playMode: 'buffer'
             };
             setRecordedSounds(prev => [...prev, newSound]);
+            setViewMode('timeline');
           } catch (err) {
             console.error('Recording process error:', err);
+            alert('麦克风录音生成失败，请再试一次。');
           }
         }
-        
-        stream.getTracks().forEach(track => track.stop());
       };
 
       recorder.start();
       setIsRecording(true);
     } catch (err) {
       console.error('Error starting recording:', err);
+      alert('无法启动麦克风录音，请检查浏览器麦克风权限。');
     }
   };
 
   const stopRecording = () => {
     if (mediaRecorderRef.current && isRecording) {
+      mediaRecorderRef.current.requestData();
       mediaRecorderRef.current.stop();
-      setIsRecording(false);
     }
   };
 
@@ -3015,31 +3395,13 @@ export default function App() {
     }
   };
 
-  const deleteRecordedSound = (e: React.MouseEvent, soundId: string) => {
-    e.stopPropagation();
-    setRecordedSounds(prev => prev.filter(sound => sound.id !== soundId));
-    setTimelineClips(prev => prev.filter(clip => clip.soundId !== soundId));
-    setSelectedTimelineClipId(prev => {
-      const selectedClip = timelineClips.find(clip => clip.id === prev);
-      return selectedClip?.soundId === soundId ? null : prev;
-    });
-
-    setTabs(prev => prev.map(tab => {
-      const nextSlots = tab.slots.map(slot => slot?.id === soundId ? null : slot);
-      if (nextSlots.every((slot, index) => slot === tab.slots[index])) return tab;
-      const nextTab = { ...tab, slots: nextSlots };
-      syncProjectEngine(nextTab);
-      return nextTab;
-    }));
-  };
-
   const categories = [
     { id: 'beat', name: 'Beats' },
     { id: 'effect', name: 'Effects' },
     { id: 'melody', name: 'Melodies' },
     { id: 'bass', name: 'Basses' },
     { id: 'experimental', name: 'Experimental' },
-    { id: 'theme', name: '旋律组' },
+    { id: 'theme', name: 'Theme Loops' },
   ];
   const extraCategories = [
     { id: 'animal', name: 'Animal Samples' },
@@ -3076,6 +3438,26 @@ export default function App() {
     : "bg-white/5 hover:bg-white/10 text-zinc-300 border-white/5";
   const mutedTextClass = isDayMode ? "text-slate-500" : "text-zinc-500";
   const hairlineClass = isDayMode ? "bg-slate-200" : "bg-zinc-800";
+  const globalRecordLabel = globalRecordingState === 'waiting'
+    ? 'Wait BPM'
+    : globalRecordingState === 'recording'
+      ? 'Recording'
+      : globalRecordingState === 'stopping'
+        ? 'Closing'
+        : 'Arrange Rec';
+  const globalRecordTitle = globalRecordingState === 'waiting'
+    ? 'Waiting for the next global BPM loop start. Click again to cancel.'
+    : globalRecordingState === 'recording'
+      ? 'Click to stop at the next global BPM loop start'
+      : globalRecordingState === 'stopping'
+        ? 'Waiting for the next global BPM loop start to finish recording'
+        : 'Click to start recording at the next global BPM loop start';
+  const canSaveArrangementFile = Boolean(exportTarget) && !isSavingArrangementFile && !isExportingArrangement;
+  const saveArrangementTitle = exportTarget
+    ? exportTarget.mode === 'file-handle'
+      ? `保存到上次导出的文件：${exportTarget.fileName}`
+      : `使用上次导出文件名保存：${exportTarget.fileName}`
+    : '首次 Export 成功后可用';
 
   const renderLibraryCategory = (cat: { id: string; name: string }) => {
     const staticItems = AVAILABLE_SOUNDS.filter(s => s.category === cat.id);
@@ -3129,7 +3511,7 @@ export default function App() {
                {cat.id === 'custom' && (
                  <button
                    type="button"
-                   onClick={(e) => deleteRecordedSound(e, item.id)}
+                   onClick={(e) => deleteRecordedSound(item.id, e)}
                    onMouseDown={(e) => e.stopPropagation()}
                    draggable={false}
                    className="absolute -top-1 -right-1 flex h-5 w-5 items-center justify-center rounded-full bg-red-500 text-white opacity-85 shadow-md transition hover:opacity-100 z-20"
@@ -3239,12 +3621,33 @@ export default function App() {
              New
           </button>
 
-          <button
-             onClick={handleExportArrangement}
-             className="px-3 py-2 rounded-lg bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-white text-[9px] font-bold uppercase tracking-widest transition-all"
-          >
-             Export
-          </button>
+	          <button
+	             onClick={handleSaveArrangementFile}
+	             disabled={!canSaveArrangementFile}
+	             aria-label={saveArrangementTitle}
+	             title={saveArrangementTitle}
+	             className={cn(
+	               "px-3 py-2 rounded-lg text-[9px] font-bold uppercase tracking-widest transition-all inline-flex items-center gap-1.5",
+	               canSaveArrangementFile
+	                 ? "bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-white"
+	                 : "bg-white/[0.03] text-zinc-700 cursor-not-allowed"
+	             )}
+	          >
+	             <Save size={12} strokeWidth={2.6} />
+	             {isSavingArrangementFile ? 'Saving' : 'Save'}
+	          </button>
+	          <button
+	             onClick={handleExportArrangement}
+	             disabled={isExportingArrangement || isSavingArrangementFile}
+	             className={cn(
+	               "px-3 py-2 rounded-lg text-[9px] font-bold uppercase tracking-widest transition-all",
+	               isExportingArrangement || isSavingArrangementFile
+	                 ? "bg-white/[0.03] text-zinc-700 cursor-wait"
+	                 : "bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-white"
+	             )}
+	          >
+	             {isExportingArrangement ? 'Exporting' : 'Export'}
+	          </button>
           <button
              onClick={() => importFileInputRef.current?.click()}
              className="px-3 py-2 rounded-lg bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-white text-[9px] font-bold uppercase tracking-widest transition-all"
@@ -3284,19 +3687,26 @@ export default function App() {
 
         <div className="flex shrink-0 items-center gap-2 pb-3">
           <button
-             onClick={toggleGlobalRecording}
-             aria-label={isGlobalRecording ? 'Stop global arrangement recording' : 'Start global arrangement recording'}
-             title={isGlobalRecording ? 'Stop global arrangement recording' : 'Start global arrangement recording'}
+             onClick={handleGlobalRecordingToggle}
+             aria-label={globalRecordTitle}
+             title={globalRecordTitle}
              className={cn(
                "h-10 rounded-full border px-3 sm:px-4 flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest transition-all shadow-sm",
-               isGlobalRecording
+               globalRecordingState === 'recording'
                  ? "bg-red-500 text-white border-red-400 animate-pulse shadow-[0_0_24px_rgba(239,68,68,0.28)]"
-                 : isDayMode ? "bg-slate-900 text-white border-slate-900 hover:bg-slate-700" : "bg-white text-zinc-950 border-white hover:bg-zinc-200"
+                 : globalRecordingState === 'waiting'
+                   ? "bg-zinc-600 text-zinc-200 border-zinc-500 cursor-wait"
+                   : globalRecordingState === 'stopping'
+                     ? "bg-zinc-800 text-red-200 border-red-500/40 cursor-wait"
+                     : isDayMode ? "bg-slate-900 text-white border-slate-900 hover:bg-slate-700" : "bg-white text-zinc-950 border-white hover:bg-zinc-200"
              )}
           >
-             <Circle className={cn("w-3.5 h-3.5", isGlobalRecording ? "fill-white" : "fill-red-500 text-red-500")} />
-             <span className="hidden sm:inline">{isGlobalRecording ? `Recording ${arrangementEvents.length}` : 'Arrange Rec'}</span>
-             <span className="sm:hidden">{isGlobalRecording ? arrangementEvents.length : 'Rec'}</span>
+             <Circle className={cn(
+               "w-3.5 h-3.5",
+               globalRecordingState === 'recording' ? "fill-white text-white" : globalRecordingState === 'waiting' ? "fill-zinc-300 text-zinc-300" : "fill-red-500 text-red-500"
+             )} />
+             <span className="hidden sm:inline">{globalRecordLabel}</span>
+             <span className="sm:hidden">{globalRecordingState === 'recording' ? arrangementEvents.length : globalRecordLabel}</span>
           </button>
           <button
              onClick={() => setViewMode(prev => prev === 'timeline' ? 'matrix' : 'timeline')}
